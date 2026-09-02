@@ -53,16 +53,38 @@ def extract_passport_details(image_np):
     gray = cv2.cvtColor(bottom_half, cv2.COLOR_BGR2GRAY)
     results = reader.readtext(gray, detail=0)
     
-    surname, given = "UNKNOWN", "TRAVELER"
+    details = {
+        "Surname": "UNKNOWN", "Given Name": "TRAVELER", 
+        "Passport No": "NOT FOUND", "Nationality": "NOT FOUND", 
+        "DOB": "NOT FOUND", "Sex": "NOT FOUND"
+    }
+    
+    lines = []
     for res in results:
         res = res.replace(' ', '').replace('_', '<').replace('-', '<').upper()
-        if '<' in res and len(res) > 20:
-            name_part = res[5:44]
-            name_split = name_part.split('<<')
-            surname = name_split[0].replace('<', ' ').strip()
-            given = name_split[1].replace('<', ' ').strip() if len(name_split) > 1 else ""
-            break
-    return surname, given
+        if len(res) > 30 and '<' in res:
+            lines.append(res)
+            
+    for line in lines:
+        if line.startswith('P') or line.startswith('V') or ('<<' in line and line.index('<<') < 30):
+            try:
+                name_part = line[5:]
+                if '<<' in name_part:
+                    name_split = name_part.split('<<')
+                    details["Surname"] = name_split[0].replace('<', ' ').strip()
+                    details["Given Name"] = name_split[1].replace('<', ' ').strip()
+            except:
+                pass
+        else:
+            if len(line) >= 28:
+                details["Passport No"] = line[0:9].replace('<', '')
+                details["Nationality"] = line[10:13].replace('<', '')
+                dob_raw = line[13:19]
+                if dob_raw.isdigit():
+                    details["DOB"] = f"{dob_raw[4:6]}/{dob_raw[2:4]}/{dob_raw[0:2]}"
+                details["Sex"] = line[20] if len(line) > 20 else ""
+                
+    return details
 
 def extract_secondary_details(img_np, doc_type):
     gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
@@ -144,7 +166,8 @@ if mode == "📑 Multi-Doc Triangulation":
                 ela_clean, ela_img, diff_score = detect_tampering(pass_pil, "Passport")
                 
                 my_bar.progress(30, text="Extracting Identity Anchors...")
-                surname, given = extract_passport_details(np.array(pass_pil))
+                pass_details = extract_passport_details(np.array(pass_pil))
+                surname, given = pass_details["Surname"], pass_details["Given Name"]
                 
                 my_bar.progress(60, text="Cross-referencing Secondary Documents...")
                 dl_text, dl_valid = extract_secondary_details(np.array(dl_pil), "Driving License")
@@ -167,20 +190,21 @@ if mode == "📑 Multi-Doc Triangulation":
                 
                 if threat_level == 0:
                     st.success(f"✅ CLEARANCE GRANTED: Identity verified for {given} {surname}.")
+                    st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Sex: {pass_details['Sex']} | Nat: {pass_details['Nationality']}")
                     log_verification(f"{given} {surname}", "CLEARED", f"{threat_level}%", "Multi-Doc Multi-Factor")
                 else:
-                    st.error(f"🚨 ALERT: {failed_checks} Security Anomalies Detected.")
+                    st.error(f"🚨 ALERT: {failed_checks} Security Anomalies Detected. Identity Rejected.")
                     log_verification(f"{given} {surname}", "REJECTED - HIGH RISK", f"{threat_level}%", "Multi-Doc Multi-Factor")
 
                 st.markdown("### Deep Rationale Breakdown")
-                if not ela_clean: st.error("❌ **Forensics:** Image compression variance exceeds safe limits (Potential forgery).")
-                else: st.info("✔️ **Forensics:** Passport pixels are mathematically untampered.")
+                if not ela_clean: st.error(f"❌ **Forensics (Forgery):** Pixel Variance is {diff_score}. This is outside the natural baseline, indicating digital alteration, splicing, or a low-quality photocopy.")
+                else: st.info(f"✔️ **Forensics:** Passport pixels are mathematically untampered (Score: {diff_score}).")
                 
-                if not (dl_name_match and id_name_match): st.error("❌ **Cross-Linkage:** Anchor name does not match across secondary documents.")
+                if not (dl_name_match and id_name_match): st.error(f"❌ **Cross-Linkage (Stolen ID):** Anchor name '{surname}' does not match the names extracted from the secondary documents.")
                 else: st.info("✔️ **Cross-Linkage:** Name successfully verified across all 3 documents.")
                 
-                if not face_match: st.error("❌ **Biometrics:** Facial topology mismatch (Potential Impersonator).")
-                else: st.info("✔️ **Biometrics:** Live face strictly matches document portrait.")
+                if not face_match: st.error(f"❌ **Biometrics (Impersonation):** Facial topology mismatch. The live person does not match the ID photo (Distance: {dist:.2f}, must be < 1.0).")
+                else: st.info(f"✔️ **Biometrics:** Live face strictly matches document portrait (Distance: {dist:.2f}).")
 
 # ==========================================
 # MODE 2: SINGLE DOC QUICK-SCAN (Forensics Only)
@@ -208,7 +232,8 @@ elif mode == "📄 Single Doc Quick-Scan":
                     name = "UNKNOWN"
                     format_valid = False
                     if "Passport" in doc_type:
-                        surname, given = extract_passport_details(np.array(doc_pil))
+                        pass_details = extract_passport_details(np.array(doc_pil))
+                        surname, given = pass_details["Surname"], pass_details["Given Name"]
                         name = f"{given} {surname}"
                         format_valid = (surname != "UNKNOWN")
                     else:
@@ -238,6 +263,7 @@ elif mode == "📄 Single Doc Quick-Scan":
                         st.error(f"❌ **Document Format FAILED:** Could not locate a valid, standardized structural ID format for {doc_type.split(' ')[0]}.")
                     elif "Passport" in doc_type: 
                         st.info(f"✔️ **MRZ Structure PASSED:** Anchor Name Parsed: {name}")
+                        st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Sex: {pass_details['Sex']} | Nationality: {pass_details['Nationality']}")
                     else: 
                         st.info(f"✔️ **Document Format PASSED:** Valid ID structure detected for {doc_type.split(' ')[0]}.")
 
