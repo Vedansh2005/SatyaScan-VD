@@ -5,10 +5,28 @@ from PIL import Image, ImageChops, ImageEnhance
 import easyocr
 import re
 import pandas as pd
+import json
 from datetime import datetime
 import os
 from facenet_pytorch import MTCNN, InceptionResnetV1
 import torch
+
+# --- LOAD BLACKLIST ---
+BLACKLIST_FILE = "blacklist.json"
+def load_blacklist():
+    if os.path.exists(BLACKLIST_FILE):
+        with open(BLACKLIST_FILE, "r") as f:
+            data = json.load(f)
+        return {entry["number"]: entry for entry in data["blocked_passports"]}
+    return {}
+
+BLACKLIST = load_blacklist()
+
+def check_blacklist(passport_no):
+    """Returns (is_blacklisted, reason) tuple."""
+    if passport_no in BLACKLIST:
+        return True, BLACKLIST[passport_no]["reason"]
+    return False, ""
 
 # --- 1. INITIALIZE OFFLINE MODELS ---
 @st.cache_resource
@@ -56,7 +74,8 @@ def extract_passport_details(image_np):
     details = {
         "Surname": "UNKNOWN", "Given Name": "TRAVELER", 
         "Passport No": "NOT FOUND", "Nationality": "NOT FOUND", 
-        "DOB": "NOT FOUND", "Sex": "NOT FOUND"
+        "DOB": "NOT FOUND", "Sex": "NOT FOUND",
+        "Expiry": "NOT FOUND", "Is Expired": False
     }
     
     lines = []
@@ -66,15 +85,23 @@ def extract_passport_details(image_np):
             lines.append(res)
             
     for line in lines:
-        if line.startswith('P') or line.startswith('V') or ('<<' in line and line.index('<<') < 30):
-            try:
-                name_part = line[5:]
-                if '<<' in name_part:
-                    name_split = name_part.split('<<')
-                    details["Surname"] = name_split[0].replace('<', ' ').strip()
-                    details["Given Name"] = name_split[1].replace('<', ' ').strip()
-            except:
-                pass
+        if '<<' in line and line.find('<<') < 25:
+            # Line 1 Name block
+            idx = line.find('<<')
+            if idx > 5:
+                surname = line[5:idx].replace('<', ' ').strip()
+            else:
+                surname = line[:idx].replace('<', ' ').strip()
+            
+            # Given names
+            given_part = line[idx+2:]
+            if '<<' in given_part:
+                given = given_part.split('<<')[0].replace('<', ' ').strip()
+            else:
+                given = given_part.replace('<', ' ').strip()
+                
+            details["Surname"] = surname
+            details["Given Name"] = given
         else:
             if len(line) >= 28:
                 details["Passport No"] = line[0:9].replace('<', '')
@@ -83,7 +110,22 @@ def extract_passport_details(image_np):
                 if dob_raw.isdigit():
                     details["DOB"] = f"{dob_raw[4:6]}/{dob_raw[2:4]}/{dob_raw[0:2]}"
                 details["Sex"] = line[20] if len(line) > 20 else ""
-                
+                # Extract expiry: characters 21-26 in MRZ line 2 = YYMMDD
+                expiry_raw = line[21:27] if len(line) > 26 else ""
+                if expiry_raw.isdigit():
+                    exp_year = int(expiry_raw[0:2])
+                    exp_month = int(expiry_raw[2:4])
+                    exp_day = int(expiry_raw[4:6])
+                    # Years 00-30 = 2000s, 31-99 = 1900s
+                    full_year = 2000 + exp_year if exp_year <= 30 else 1900 + exp_year
+                    try:
+                        expiry_date = datetime(full_year, exp_month, exp_day)
+                        details["Expiry"] = expiry_date.strftime("%d/%m/%Y")
+                        details["Is Expired"] = expiry_date < datetime.now()
+                    except:
+                        details["Expiry"] = "PARSE ERROR"
+                        details["Is Expired"] = False
+                        
     return details
 
 def extract_secondary_details(img_np, doc_type):
@@ -179,18 +221,23 @@ if mode == "📑 Multi-Doc Triangulation":
                 face_match, dist = verify_face(pass_pil, live_pil)
                 my_bar.progress(100, text="Analysis Complete.")
                 
-                failed_checks = [ela_clean, dl_name_match, dl_valid, id_name_match, id_valid, face_match].count(False)
-                threat_level = min((failed_checks * 25), 100)
+                # Blacklist & Expiry checks
+                passport_no = pass_details.get("Passport No", "NOT FOUND")
+                is_blacklisted, bl_reason = check_blacklist(passport_no)
+                is_expired = pass_details.get("Is Expired", False)
+
+                failed_checks = [ela_clean, dl_name_match, dl_valid, id_name_match, id_valid, face_match, not is_blacklisted, not is_expired].count(False)
+                threat_level = min((failed_checks * 20), 100)
                 
                 st.divider()
                 metrics_cols = st.columns(3)
                 metrics_cols[0].metric("Threat Level", f"{threat_level}%", delta="HIGH" if threat_level > 0 else "LOW", delta_color="inverse")
                 metrics_cols[1].metric("Biometric Distance", f"{dist:.2f}", delta="< 1.0 Required", delta_color="off")
-                metrics_cols[2].metric("Pixel Variance", f"{diff_score}", delta="< 50 Required", delta_color="off")
+                metrics_cols[2].metric("Pixel Variance", f"{diff_score}", delta="Baseline: 20–100", delta_color="off")
                 
                 if threat_level == 0:
                     st.success(f"✅ CLEARANCE GRANTED: Identity verified for {given} {surname}.")
-                    st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Sex: {pass_details['Sex']} | Nat: {pass_details['Nationality']}")
+                    st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Expiry: {pass_details['Expiry']} | Sex: {pass_details['Sex']} | Nat: {pass_details['Nationality']}")
                     log_verification(f"{given} {surname}", "CLEARED", f"{threat_level}%", "Multi-Doc Multi-Factor")
                 else:
                     st.error(f"🚨 ALERT: {failed_checks} Security Anomalies Detected. Identity Rejected.")
@@ -205,6 +252,12 @@ if mode == "📑 Multi-Doc Triangulation":
                 
                 if not face_match: st.error(f"❌ **Biometrics (Impersonation):** Facial topology mismatch. The live person does not match the ID photo (Distance: {dist:.2f}, must be < 1.0).")
                 else: st.info(f"✔️ **Biometrics:** Live face strictly matches document portrait (Distance: {dist:.2f}).")
+                
+                if is_expired: st.error(f"❌ **Validity (Expired Document):** Passport expired on {pass_details['Expiry']}. Document is no longer valid for travel.")
+                elif pass_details['Expiry'] != 'NOT FOUND': st.info(f"✔️ **Validity:** Passport is valid until {pass_details['Expiry']}.")
+                
+                if is_blacklisted: st.error(f"⛔ **BLACKLIST HIT:** Passport No. `{passport_no}` is on the SSB/Interpol watchlist. Reason: *{bl_reason}*")
+                elif passport_no != 'NOT FOUND': st.info(f"✔️ **Blacklist:** Passport No. `{passport_no}` is clear — not on any watchlist.")
 
 # ==========================================
 # MODE 2: SINGLE DOC QUICK-SCAN (Forensics Only)
@@ -239,7 +292,17 @@ elif mode == "📄 Single Doc Quick-Scan":
                     else:
                         full_text, format_valid = extract_secondary_details(np.array(doc_pil), doc_type)
                         
-                    threat = 0 if (ela_clean and format_valid) else 100
+                    # Expiry and blacklist for Mode 2 (Passport only)
+                    is_expired_m2 = False
+                    is_blacklisted_m2 = False
+                    bl_reason_m2 = ""
+                    passport_no_m2 = "NOT FOUND"
+                    if "Passport" in doc_type:
+                        passport_no_m2 = pass_details.get("Passport No", "NOT FOUND")
+                        is_expired_m2 = pass_details.get("Is Expired", False)
+                        is_blacklisted_m2, bl_reason_m2 = check_blacklist(passport_no_m2)
+
+                    threat = 0 if (ela_clean and format_valid and not is_expired_m2 and not is_blacklisted_m2) else 100
                     
                     st.divider()
                     if threat == 0:
@@ -263,9 +326,18 @@ elif mode == "📄 Single Doc Quick-Scan":
                         st.error(f"❌ **Document Format FAILED:** Could not locate a valid, standardized structural ID format for {doc_type.split(' ')[0]}.")
                     elif "Passport" in doc_type: 
                         st.info(f"✔️ **MRZ Structure PASSED:** Anchor Name Parsed: {name}")
-                        st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Sex: {pass_details['Sex']} | Nationality: {pass_details['Nationality']}")
+                        st.write(f"**Extracted Data:** Passport No: {pass_details['Passport No']} | DOB: {pass_details['DOB']} | Expiry: {pass_details['Expiry']} | Sex: {pass_details['Sex']} | Nationality: {pass_details['Nationality']}")
+
                     else: 
                         st.info(f"✔️ **Document Format PASSED:** Valid ID structure detected for {doc_type.split(' ')[0]}.")
+
+                    # Mode 2 expiry & blacklist rationale
+                    if "Passport" in doc_type:
+                        if is_expired_m2: st.error(f"❌ **Validity (Expired):** Passport expired on {pass_details['Expiry']}. Document is no longer valid for travel.")
+                        elif pass_details['Expiry'] != 'NOT FOUND': st.info(f"✔️ **Validity:** Passport valid until {pass_details['Expiry']}.")
+
+                        if is_blacklisted_m2: st.error(f"⛔ **BLACKLIST HIT:** Passport No. `{passport_no_m2}` flagged on SSB/Interpol watchlist. Reason: *{bl_reason_m2}*")
+                        elif passport_no_m2 != 'NOT FOUND': st.info(f"✔️ **Blacklist:** Passport No. `{passport_no_m2}` is clear.")
 
 # ==========================================
 # MODE 3: BORDER AUDIT LOGS

@@ -1,0 +1,7 @@
+{
+  "blocked_passports": [
+    {"number": "K989802C3", "reason": "Interpol Red Notice — Human Trafficking", "flagged_date": "2024-01-15"},
+    {"number": "S456789A1", "reason": "SSB Watchlist — Multiple Identity Fraud", "flagged_date": "2025-03-22"},
+    {"number": "X123456ZZ", "reason": "Expired & Previously Seized at Attari Border", "flagged_date": "2023-11-05"}
+  ]
+}
